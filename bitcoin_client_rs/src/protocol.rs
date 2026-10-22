@@ -13,6 +13,67 @@ use bitcoin::{
 
 use crate::psbt::{PartialSignature, PartialSignatureError};
 
+/// Prepares wallet registration and its delegated wallet preimages and key tree.
+pub fn prepare_register_wallet(
+    wallet: &crate::wallet::WalletPolicy,
+) -> (
+    crate::apdu::APDUCommand,
+    crate::interpreter::ClientCommandInterpreter,
+) {
+    (
+        crate::command::register_wallet(wallet),
+        crate::interpreter::ClientCommandInterpreter::for_wallet(wallet),
+    )
+}
+
+/// Prepares an address request and its delegated wallet preimages and key tree.
+/// This does not independently verify the returned address; call `check_address`
+/// when the `paranoid_client` feature is enabled.
+pub fn prepare_get_wallet_address(
+    wallet: &crate::wallet::WalletPolicy,
+    hmac: Option<&[u8; 32]>,
+    change: bool,
+    address_index: u32,
+    display: bool,
+) -> (
+    crate::apdu::APDUCommand,
+    crate::interpreter::ClientCommandInterpreter,
+) {
+    (
+        crate::command::get_wallet_address(wallet, hmac, change, address_index, display),
+        crate::interpreter::ClientCommandInterpreter::for_wallet(wallet),
+    )
+}
+
+/// Executes one delegated device request and prepares its CONTINUE command.
+/// Call this only for an interrupted-execution response, with its status bytes removed.
+/// The caller owns transport exchanges and the status loop.
+pub fn continue_interrupted(
+    interpreter: &mut crate::interpreter::ClientCommandInterpreter,
+    request: Vec<u8>,
+) -> Result<crate::apdu::APDUCommand, crate::interpreter::InterpreterError> {
+    Ok(crate::command::continue_interrupted(
+        interpreter.execute(request)?,
+    ))
+}
+
+/// Prepares a message command and the delegated state for its 64-byte chunks.
+pub fn prepare_sign_message(
+    message: &[u8],
+    path: &bitcoin::bip32::DerivationPath,
+) -> (
+    crate::apdu::APDUCommand,
+    crate::interpreter::ClientCommandInterpreter,
+) {
+    let chunks: Vec<&[u8]> = message.chunks(64).collect();
+    let mut interpreter = crate::interpreter::ClientCommandInterpreter::new();
+    let root = interpreter.add_known_list(&chunks);
+    (
+        crate::command::sign_message(message.len(), &root, path),
+        interpreter,
+    )
+}
+
 /// An encoding error in an ordinary device response; no response bytes are retained.
 #[derive(Debug)]
 pub enum ResponseError {

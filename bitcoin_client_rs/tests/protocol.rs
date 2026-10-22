@@ -440,3 +440,147 @@ fn response_parsers_preserve_wire_contracts() {
         Err(ResponseError::InvalidFormat { .. })
     ));
 }
+
+#[test]
+fn wallet_and_message_preparation_supply_delegated_preimages() {
+    use ledger_bitcoin_client::protocol::{
+        prepare_get_wallet_address, prepare_register_wallet, prepare_sign_message,
+    };
+    const MESSAGE_CHUNK_SIZE: usize = 64;
+    for version in [Version::V1, Version::V2] {
+        let wallet = wallet(version);
+        let (registration, interpreter) = prepare_register_wallet(&wallet);
+        assert_eq!(
+            (
+                registration.cla,
+                registration.ins,
+                registration.p1,
+                registration.p2
+            ),
+            (
+                EXPECTED_BITCOIN_CLA,
+                EXPECTED_REGISTER_WALLET_INS,
+                0,
+                EXPECTED_PROTOCOL_VERSION
+            )
+        );
+        let mut expected = vec![wallet.serialize().len() as u8];
+        expected.extend(wallet.serialize());
+        assert_eq!(registration.data, expected);
+        let mut interpreters = vec![interpreter];
+        let hmac = [7; 32];
+        for (hmac, change, index, display) in
+            [(None, false, 0, false), (Some(&hmac), true, u32::MAX, true)]
+        {
+            let (address, interpreter) =
+                prepare_get_wallet_address(&wallet, hmac, change, index, display);
+            assert_eq!(
+                (address.cla, address.ins, address.p1, address.p2),
+                (
+                    EXPECTED_BITCOIN_CLA,
+                    EXPECTED_GET_WALLET_ADDRESS_INS,
+                    0,
+                    EXPECTED_PROTOCOL_VERSION
+                )
+            );
+            let mut expected = vec![u8::from(display)];
+            expected.extend(wallet.id());
+            expected.extend(hmac.unwrap_or(&[0; 32]));
+            expected.push(u8::from(change));
+            expected.extend(index.to_be_bytes());
+            assert_eq!(address.data, expected);
+            interpreters.push(interpreter);
+        }
+        for mut interpreter in interpreters {
+            for preimage in [
+                wallet.serialize(),
+                wallet.descriptor_template.as_bytes().to_vec(),
+                [&[MERKLE_LEAF_PREFIX][..], KEY.as_bytes()].concat(),
+            ] {
+                let mut request = vec![ClientCommandCode::GetPreimage as u8, SHA256_HASH_TYPE];
+                request.extend(hash(&preimage));
+                let mut expected = vec![preimage.len() as u8, preimage.len() as u8];
+                expected.extend(preimage);
+                assert_eq!(interpreter.execute(request).unwrap(), expected);
+            }
+            let key_leaf = hash(&[&[MERKLE_LEAF_PREFIX][..], KEY.as_bytes()].concat());
+            let mut request = vec![ClientCommandCode::GetMerkleLeafProof as u8];
+            request.extend(key_leaf);
+            request.extend([1, 0]); // One-key tree, leaf zero.
+            let mut expected = key_leaf.to_vec();
+            expected.extend([0, 0]); // No siblings, no queued proof elements.
+            assert_eq!(interpreter.execute(request).unwrap(), expected);
+        }
+    }
+    let path = DerivationPath::from_str("m/44'/1'/0'/0").unwrap();
+    for length in [
+        1,
+        MESSAGE_CHUNK_SIZE,
+        MESSAGE_CHUNK_SIZE + 1,
+        2 * MESSAGE_CHUNK_SIZE,
+        2 * MESSAGE_CHUNK_SIZE + 1,
+    ] {
+        let message = vec![0x55; length];
+        let (command, mut interpreter) = prepare_sign_message(&message, &path);
+        let chunks: Vec<_> = message.chunks(MESSAGE_CHUNK_SIZE).collect();
+        let leaves = chunks
+            .iter()
+            .map(|chunk| hash(&[&[MERKLE_LEAF_PREFIX][..], chunk].concat()))
+            .collect();
+        let root = *MerkleTree::new(leaves).root_hash();
+        assert_eq!(
+            command.encode(),
+            command::sign_message(length, &root, &path).encode()
+        );
+        for chunk in chunks {
+            let preimage = [&[MERKLE_LEAF_PREFIX][..], chunk].concat();
+            let mut request = vec![ClientCommandCode::GetPreimage as u8, SHA256_HASH_TYPE];
+            request.extend(hash(&preimage));
+            let response = interpreter.execute(request).unwrap();
+            assert_eq!(&response[2..], preimage);
+        }
+    }
+}
+
+#[test]
+fn continuation_preserves_fragment_queue_yields_and_errors() {
+    use ledger_bitcoin_client::{interpreter::InterpreterError, protocol::continue_interrupted};
+    let mut interpreter = ClientCommandInterpreter::new();
+    let preimage = vec![0x55; 256];
+    interpreter.add_known_preimage(preimage.clone());
+    let mut request = vec![ClientCommandCode::GetPreimage as u8, SHA256_HASH_TYPE];
+    request.extend(hash(&preimage));
+    let first = continue_interrupted(&mut interpreter, request).unwrap();
+    assert_eq!(
+        &first.encode()[..9],
+        &hex::decode("f8010001fffd0001fb").unwrap()
+    );
+    assert_eq!(&first.data[4..], &preimage[..251]);
+    let more = vec![ClientCommandCode::GetMoreElements as u8];
+    assert_eq!(
+        continue_interrupted(&mut interpreter, more.clone())
+            .unwrap()
+            .encode(),
+        hex::decode("f80100010705015555555555").unwrap()
+    );
+    assert!(matches!(
+        continue_interrupted(&mut interpreter, more),
+        Err(InterpreterError::UnexpectedQueue)
+    ));
+    assert!(matches!(
+        continue_interrupted(&mut interpreter, vec![]),
+        Err(InterpreterError::EmptyInput)
+    ));
+    assert!(matches!(
+        continue_interrupted(&mut interpreter, vec![0xff]),
+        Err(InterpreterError::UnknownCommand(0xff))
+    ));
+    let yielded = vec![ClientCommandCode::Yield as u8, 1, 2];
+    assert_eq!(
+        continue_interrupted(&mut interpreter, yielded)
+            .unwrap()
+            .encode(),
+        hex::decode("f801000100").unwrap()
+    );
+    assert_eq!(interpreter.yielded(), vec![vec![1, 2]]);
+}
