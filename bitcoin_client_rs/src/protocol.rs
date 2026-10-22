@@ -1,5 +1,7 @@
 //! This module contains types that are specific to the Ledger Bitcoin application protocol.
 
+use core::convert::TryFrom;
+
 use bitcoin::{
     consensus::encode::{deserialize_partial, Decodable, Encodable, Error as EncodeError},
     hashes::Hash,
@@ -137,6 +139,7 @@ pub enum SignPsbtYieldedObject {
 /// Parses a single payload yielded by the device during `sign_psbt`.
 ///
 /// On success returns the input index together with the decoded object.
+/// Input indices must fit in a `u32`, independently of the host pointer width.
 pub fn parse_sign_psbt_yielded(
     data: &[u8],
 ) -> Result<(usize, SignPsbtYieldedObject), PartialSignatureError> {
@@ -169,7 +172,8 @@ pub fn parse_sign_psbt_yielded(
                 None
             };
             Ok((
-                input_index as usize,
+                u32::try_from(input_index).map_err(|_| PartialSignatureError::InvalidLength)?
+                    as usize,
                 SignPsbtYieldedObject::MusigPubNonce(MusigPubNonce {
                     participant_pubkey,
                     aggregate_pubkey,
@@ -203,7 +207,8 @@ pub fn parse_sign_psbt_yielded(
                 None
             };
             Ok((
-                input_index as usize,
+                u32::try_from(input_index).map_err(|_| PartialSignatureError::InvalidLength)?
+                    as usize,
                 SignPsbtYieldedObject::MusigPartialSignature(MusigPartialSignature {
                     participant_pubkey,
                     aggregate_pubkey,
@@ -222,14 +227,16 @@ pub fn parse_sign_psbt_yielded(
                     .map_err(|_| PartialSignatureError::InvalidLength)?;
             let rest = &data[i + j..];
             Ok((
-                input_index as usize,
+                u32::try_from(input_index).map_err(|_| PartialSignatureError::InvalidLength)?
+                    as usize,
                 SignPsbtYieldedObject::Unknown(rest.to_vec()),
             ))
         }
         // Otherwise the leading varint is the input index and the remainder is a regular partial signature.
         // These are the only payloads that were used in protocol versions prior to the introduction of the tags.
         _ => {
-            let input_index = tag as usize;
+            let input_index =
+                u32::try_from(tag).map_err(|_| PartialSignatureError::InvalidLength)? as usize;
             let ps = PartialSignature::from_slice(&data[i..])?;
             Ok((input_index, SignPsbtYieldedObject::Partial(ps)))
         }
