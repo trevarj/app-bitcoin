@@ -584,3 +584,239 @@ fn continuation_preserves_fragment_queue_yields_and_errors() {
     );
     assert_eq!(interpreter.yielded(), vec![vec![1, 2]]);
 }
+
+fn unsigned_psbt() -> bitcoin::psbt::Psbt {
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Witness,
+    };
+    bitcoin::psbt::Psbt::from_unsigned_tx(Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    })
+    .unwrap()
+}
+
+#[test]
+fn psbt_maps_forward_unknown_and_proprietary_keys_and_reject_conflicts() {
+    use bitcoin::psbt::raw::{Key, ProprietaryKey};
+    use ledger_bitcoin_client::{
+        protocol::prepare_sign_psbt,
+        psbt::{get_v2_maps, PsbtV2Error},
+    };
+    const TEST_UNKNOWN_KEY_TYPE: u8 = 0x70;
+    const PSBT_PROPRIETARY_KEY_TYPE: u8 = 0xfc;
+    const PSBT_GLOBAL_TX_VERSION: u8 = 0x02;
+    const PSBT_GLOBAL_FALLBACK_LOCKTIME: u8 = 0x03;
+    const PSBT_GLOBAL_INPUT_COUNT: u8 = 0x04;
+    const PSBT_GLOBAL_OUTPUT_COUNT: u8 = 0x05;
+    const PSBT_GLOBAL_VERSION: u8 = 0xfb;
+    const PSBT_IN_PREVIOUS_TXID: u8 = 0x0e;
+    const PSBT_IN_OUTPUT_INDEX: u8 = 0x0f;
+    const PSBT_IN_SEQUENCE: u8 = 0x10;
+    const PSBT_OUT_AMOUNT: u8 = 0x03;
+    const PSBT_OUT_SCRIPT: u8 = 0x04;
+    let mut psbt = unsigned_psbt();
+    let unknown = Key {
+        type_value: TEST_UNKNOWN_KEY_TYPE,
+        key: vec![9],
+    };
+    let proprietary = ProprietaryKey {
+        prefix: b"hw".to_vec(),
+        subtype: 1,
+        key: vec![9],
+    };
+    psbt.unknown.insert(unknown.clone(), vec![1]);
+    psbt.inputs[0].unknown.insert(unknown.clone(), vec![2]);
+    psbt.outputs[0].unknown.insert(unknown, vec![3]);
+    psbt.proprietary.insert(proprietary.clone(), vec![4]);
+    psbt.inputs[0]
+        .proprietary
+        .insert(proprietary.clone(), vec![5]);
+    psbt.outputs[0].proprietary.insert(proprietary, vec![6]);
+    let maps = get_v2_maps(&psbt).unwrap();
+    for (i, map) in [&maps.global, &maps.inputs[0], &maps.outputs[0]]
+        .iter()
+        .enumerate()
+    {
+        assert!(map.contains(&(vec![TEST_UNKNOWN_KEY_TYPE, 9], vec![i as u8 + 1])));
+        assert!(map.contains(&(
+            vec![PSBT_PROPRIETARY_KEY_TYPE, 2, b'h', b'w', 1, 9],
+            vec![i as u8 + 4]
+        )));
+    }
+    let (_, mut interpreter) = prepare_sign_psbt(&psbt, &wallet(Version::V2), None).unwrap();
+    for value in 1..=6 {
+        let preimage = [MERKLE_LEAF_PREFIX, value];
+        let mut request = vec![ClientCommandCode::GetPreimage as u8, SHA256_HASH_TYPE];
+        request.extend(hash(&preimage));
+        assert_eq!(interpreter.execute(request).unwrap(), [2, 2, 0, value]);
+    }
+    for (map_index, key_types) in [
+        (
+            0,
+            &[
+                PSBT_GLOBAL_TX_VERSION,
+                PSBT_GLOBAL_FALLBACK_LOCKTIME,
+                PSBT_GLOBAL_INPUT_COUNT,
+                PSBT_GLOBAL_OUTPUT_COUNT,
+                PSBT_GLOBAL_VERSION,
+            ][..],
+        ),
+        (
+            1,
+            &[
+                PSBT_IN_PREVIOUS_TXID,
+                PSBT_IN_OUTPUT_INDEX,
+                PSBT_IN_SEQUENCE,
+            ][..],
+        ),
+        (2, &[PSBT_OUT_AMOUNT, PSBT_OUT_SCRIPT][..]),
+    ] {
+        for &key_type in key_types {
+            let mut conflict = unsigned_psbt();
+            let map = match map_index {
+                0 => &mut conflict.unknown,
+                1 => &mut conflict.inputs[0].unknown,
+                _ => &mut conflict.outputs[0].unknown,
+            };
+            map.insert(
+                Key {
+                    type_value: key_type,
+                    key: vec![],
+                },
+                vec![42],
+            );
+            assert_eq!(
+                get_v2_maps(&conflict).err(),
+                Some(PsbtV2Error::UnexpectedV2Field(key_type))
+            );
+            assert_eq!(
+                prepare_sign_psbt(&conflict, &wallet(Version::V2), None).err(),
+                Some(PsbtV2Error::UnexpectedV2Field(key_type))
+            );
+        }
+    }
+    psbt.inputs.clear();
+    assert_eq!(
+        prepare_sign_psbt(&psbt, &wallet(Version::V2), None).err(),
+        Some(PsbtV2Error::TxMapCountMismatch)
+    );
+}
+
+#[test]
+fn public_psbt_preparation_replays_recorded_delegated_exchanges() {
+    use ledger_bitcoin_client::{
+        apdu::StatusWord,
+        protocol::{continue_interrupted, parse_sign_psbt_yielded, prepare_sign_psbt},
+    };
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("data/sign_psbt.json")).unwrap();
+    for case in cases {
+        let psbt = bitcoin::psbt::Psbt::deserialize(
+            &base64::decode(case["psbt"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let keys: Vec<_> = case["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| WalletPubKey::from_str(key.as_str().unwrap()).unwrap())
+            .collect();
+        let wallet = WalletPolicy::new(
+            case["name"].as_str().unwrap().into(),
+            Version::V2,
+            case["policy"].as_str().unwrap().into(),
+            keys,
+        );
+        let hmac = case["hmac"].as_str().map(|value| {
+            let mut bytes = [0; 32];
+            bytes.copy_from_slice(&hex::decode(value).unwrap());
+            bytes
+        });
+        let (mut command, mut interpreter) =
+            prepare_sign_psbt(&psbt, &wallet, hmac.as_ref()).unwrap();
+        for pair in case["exchanges"].as_array().unwrap().chunks_exact(2) {
+            let expected =
+                hex::decode(pair[0].as_str().unwrap().trim_start_matches("=> ")).unwrap();
+            assert_eq!(command.encode(), expected);
+            let response =
+                hex::decode(pair[1].as_str().unwrap().trim_start_matches("<= ")).unwrap();
+            if response.ends_with(&(StatusWord::InterruptedExecution as u16).to_be_bytes()) {
+                command =
+                    continue_interrupted(&mut interpreter, response[..response.len() - 2].to_vec())
+                        .unwrap();
+            } else {
+                assert!(response.ends_with(&(StatusWord::OK as u16).to_be_bytes()));
+            }
+        }
+        let results = interpreter.yielded();
+        let expected_count: usize = ["sigs", "musig_pub_nonces", "musig_partial_signatures"]
+            .iter()
+            .map(|key| case[*key].as_array().map_or(0, Vec::len))
+            .sum();
+        assert_eq!(results.len(), expected_count);
+        for result in results {
+            assert!(parse_sign_psbt_yielded(&result).is_ok());
+        }
+    }
+}
+
+#[test]
+fn signature_application_validates_before_mutation_and_overwrites() {
+    use bitcoin::{
+        ecdsa, secp256k1,
+        taproot::{Signature, TapLeafHash},
+        PublicKey,
+    };
+    use ledger_bitcoin_client::{
+        psbt::{apply_partial_signature, InputIndexError},
+        PartialSignature,
+    };
+    let key = PublicKey::from_str(PUBKEY).unwrap();
+    let xonly = key.inner.x_only_public_key().0;
+    let leaf = TapLeafHash::from_byte_array([3; 32]);
+    let mut psbt = unsigned_psbt();
+    for byte in [1, 2] {
+        let ecdsa = ecdsa::Signature::sighash_all(
+            secp256k1::ecdsa::Signature::from_compact(&[byte; 64]).unwrap(),
+        );
+        let taproot = Signature::from_slice(&[byte; 64]).unwrap();
+        for signature in [
+            PartialSignature::Sig(key, ecdsa),
+            PartialSignature::TapScriptSig(xonly, None, taproot),
+            PartialSignature::TapScriptSig(xonly, Some(leaf), taproot),
+        ] {
+            let before = psbt.clone();
+            for input_index in [1, usize::MAX] {
+                assert_eq!(
+                    apply_partial_signature(&mut psbt, input_index, signature.clone()),
+                    Err(InputIndexError { input_index })
+                );
+                assert_eq!(psbt, before);
+            }
+            apply_partial_signature(&mut psbt, 0, signature).unwrap();
+        }
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
+        assert_eq!(psbt.inputs[0].partial_sigs[&key], ecdsa);
+        assert_eq!(psbt.inputs[0].tap_key_sig, Some(taproot));
+        assert_eq!(psbt.inputs[0].tap_script_sigs.len(), 1);
+        assert_eq!(psbt.inputs[0].tap_script_sigs[&(xonly, leaf)], taproot);
+        let mut payload = vec![0, 33];
+        payload.extend(key.to_bytes());
+        payload.extend(ecdsa.to_vec());
+        assert!(ledger_bitcoin_client::protocol::parse_sign_psbt_yielded(&payload).is_ok());
+        payload.pop();
+        assert!(ledger_bitcoin_client::protocol::parse_sign_psbt_yielded(&payload).is_err());
+    }
+}
