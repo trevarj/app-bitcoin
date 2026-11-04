@@ -518,6 +518,9 @@ fn continuation_preserves_fragment_queue_yields_and_errors() {
         interpreter::InterpreterError,
         protocol::{handle_response, RequestError, Step},
     };
+    const APDU_HEADER_LEN: usize = 5;
+    const PREIMAGE_HEADER_LEN: usize = 4;
+    const FIRST_PREIMAGE_CHUNK_LEN: usize = 251;
     let continue_interrupted =
         |interpreter: &mut ClientCommandInterpreter, data| match handle_response(
             EXPECTED_SIGN_PSBT_INS,
@@ -535,10 +538,13 @@ fn continuation_preserves_fragment_queue_yields_and_errors() {
     request.extend(hash(&preimage));
     let first = continue_interrupted(&mut interpreter, request).unwrap();
     assert_eq!(
-        &first.encode()[..9],
+        &first.encode()[..APDU_HEADER_LEN + PREIMAGE_HEADER_LEN],
         &hex::decode("f8010001fffd0001fb").unwrap()
     );
-    assert_eq!(&first.data[4..], &preimage[..251]);
+    assert_eq!(
+        &first.data[PREIMAGE_HEADER_LEN..],
+        &preimage[..FIRST_PREIMAGE_CHUNK_LEN]
+    );
     let more = vec![ClientCommandCode::GetMoreElements as u8];
     assert_eq!(
         continue_interrupted(&mut interpreter, more.clone())
@@ -643,11 +649,13 @@ fn psbt_result_batch_preserves_empty_order_and_error_precedence() {
     assert!(matches!(&parsed[0].1, SignPsbtYieldedObject::Unknown(data) if data == &[0xde, 0xad]));
 
     let malformed = [vec![0, 33], vec![0; 33], vec![1; 8]].concat();
-    let all = vec![malformed.clone(), vec![1], unknown(3)];
-    let expected = all.concat();
-    let error = parse_sign_psbt_results(all).unwrap_err();
-    assert!(matches!(error.source, PartialSignatureError::InvalidLength));
-    assert_eq!(error.data, expected);
+    for short in [vec![], vec![1]] {
+        let all = vec![malformed.clone(), short, unknown(3)];
+        let expected = all.concat();
+        let error = parse_sign_psbt_results(all).unwrap_err();
+        assert!(matches!(error.source, PartialSignatureError::InvalidLength));
+        assert_eq!(error.data, expected);
+    }
 
     let allocation = malformed.as_ptr();
     let malformed_bytes = malformed.clone();
@@ -786,7 +794,7 @@ fn psbt_preparation_delegates_custom_values_and_propagates_map_errors() {
 fn public_psbt_preparation_replays_recorded_delegated_exchanges() {
     use ledger_bitcoin_client::{
         apdu::StatusWord,
-        protocol::{handle_response, parse_sign_psbt_yielded, prepare_sign_psbt, Step},
+        protocol::{handle_response, parse_sign_psbt_results, prepare_sign_psbt, Step},
     };
     let cases: Vec<serde_json::Value> =
         serde_json::from_str(include_str!("data/sign_psbt.json")).unwrap();
@@ -839,15 +847,12 @@ fn public_psbt_preparation_replays_recorded_delegated_exchanges() {
                 Step::Done(_) => assert_eq!(status, StatusWord::OK),
             }
         }
-        let results = interpreter.yielded();
+        let results = parse_sign_psbt_results(interpreter.yielded()).unwrap();
         let expected_count: usize = ["sigs", "musig_pub_nonces", "musig_partial_signatures"]
             .iter()
             .map(|key| case[*key].as_array().map_or(0, Vec::len))
             .sum();
         assert_eq!(results.len(), expected_count);
-        for result in results {
-            assert!(parse_sign_psbt_yielded(&result).is_ok());
-        }
     }
 }
 
