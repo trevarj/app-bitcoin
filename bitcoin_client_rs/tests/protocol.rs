@@ -287,7 +287,7 @@ fn preimage_and_proof_fragmentation_and_queue_transitions() {
 const PUBKEY: &str = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
 
 #[test]
-fn response_parsers_preserve_wire_contracts() {
+fn version_response_encoding_and_decode_context() {
     use ledger_bitcoin_client::protocol::*;
     let mut version = hex::decode("010c426974636f696e205465737405322e312e300100").unwrap();
     assert_eq!(
@@ -314,6 +314,11 @@ fn response_parsers_preserve_wire_contracts() {
         );
     }
     assert!(parse_version(&[1, 0xfd, 0, 0]).is_err());
+}
+
+#[test]
+fn fingerprint_response_accepts_trailing_bytes_but_not_truncation() {
+    use ledger_bitcoin_client::protocol::{parse_master_fingerprint, ResponseError};
     assert_eq!(
         parse_master_fingerprint(&[1, 2, 3, 4, 5])
             .unwrap()
@@ -325,11 +330,21 @@ fn response_parsers_preserve_wire_contracts() {
             matches!(parse_master_fingerprint(&[0; 4][..len]), Err(ResponseError::InvalidLength { expected: 4, actual, .. }) if actual == len)
         );
     }
+}
+
+#[test]
+fn registration_response_accepts_trailing_bytes_but_not_truncation() {
+    use ledger_bitcoin_client::protocol::parse_wallet_registration;
     let registration: Vec<u8> = (0..65).collect();
     let (id, hmac) = parse_wallet_registration(&registration).unwrap();
     assert_eq!(&id, &registration[..32]);
     assert_eq!(&hmac, &registration[32..64]);
     assert!(parse_wallet_registration(&registration[..63]).is_err());
+}
+
+#[test]
+fn pubkey_response_is_untrimmed_lossy_utf8() {
+    use ledger_bitcoin_client::protocol::parse_extended_pubkey;
     let xpub = KEY.split(']').nth(1).unwrap();
     assert_eq!(
         parse_extended_pubkey(xpub.as_bytes()).unwrap().to_string(),
@@ -337,6 +352,11 @@ fn response_parsers_preserve_wire_contracts() {
     );
     assert!(parse_extended_pubkey(format!("{xpub}\n").as_bytes()).is_err());
     assert!(parse_extended_pubkey(&[0xff]).is_err());
+}
+
+#[test]
+fn address_response_is_untrimmed_lossy_utf8() {
+    use ledger_bitcoin_client::protocol::parse_wallet_address;
     let address = "tb1pws8wvnj99ca6acf8kq7pjk7vyxknah0d9mexckh5s0vu2ccy68js9am6u7";
     assert_eq!(
         parse_wallet_address(address.as_bytes())
@@ -347,6 +367,11 @@ fn response_parsers_preserve_wire_contracts() {
     );
     assert!(parse_wallet_address(format!(" {address}").as_bytes()).is_err());
     assert!(parse_wallet_address(&[0xff]).is_err());
+}
+
+#[test]
+fn message_signature_response_validates_length_and_encoding() {
+    use ledger_bitcoin_client::protocol::{parse_message_signature, ResponseError};
     let mut signature = vec![255];
     signature.extend([1; 64]);
     let (header, sig) = parse_message_signature(&signature).unwrap();
