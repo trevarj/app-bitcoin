@@ -41,6 +41,33 @@ In order to satisfy this Trait, it is possible to import the
 `ledger-transport-hid` crate from https://github.com/Zondax/ledger-rs.
 Please, read the `examples/ledger_hwi/src/transport.rs` file to find an example.
 
+## Transport-free protocol use
+
+The default features are `client`, `async`, and `paranoid_client`. Disable
+defaults to use the public `command`, `interpreter`, `merkle`, `protocol`,
+`psbt`, and `wallet` modules without either convenience client. Set
+`default-features = false` on the dependency in Cargo.toml.
+
+`protocol::prepare_register_wallet`, `prepare_get_wallet_address`,
+`prepare_sign_message`, and `prepare_sign_psbt` each return an APDU command and
+`ClientCommandInterpreter` state for a caller-owned exchange loop. For an
+`InterruptedExecution` response, pass its payload without status bytes to
+`protocol::continue_interrupted` and exchange the returned CONTINUE command.
+Transport and response-status handling remain with the caller.
+
+`protocol` also exposes response parsers. Yielded PSBT input indices must fit in
+a `u32` on every host; tags still support the full `u64` range. The parsers check
+response encodings, not signed message digests. `psbt::apply_partial_signature`
+validates input indices before updating a PSBT.
+
+Enable `client` for synchronous `BitcoinClient`/`Transport`, or `async` for
+both client modules. The independent `paranoid_client` feature enables
+`protocol::check_address` and its existing miniscript dependency without
+enabling either client. When driving exchanges yourself, call this verifier
+for returned addresses and perform the authenticated address follow-up after
+registration. Default convenience clients already perform these checks.
+Both pure feature combinations support `wasm32-unknown-unknown`.
+
 ## The `async` feature
 
 The optional feature `async` adds the `async_client` module to the crate
