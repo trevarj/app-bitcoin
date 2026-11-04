@@ -39,24 +39,40 @@ fn hash(data: &[u8]) -> [u8; 32] {
 }
 
 #[test]
-fn public_command_builders() {
+fn version_command_wire_encoding() {
     assert_eq!(
         command::get_version().encode(),
         hex::decode("b001000000").unwrap()
     );
+}
+
+#[test]
+fn fingerprint_command_wire_encoding() {
     assert_eq!(
         command::get_master_fingerprint().encode(),
         hex::decode("e105000100").unwrap()
     );
+}
+
+#[test]
+fn extended_pubkey_command_wire_encoding() {
     let path = DerivationPath::from_str("m/44'/1/0").unwrap();
     assert_eq!(
         command::get_extended_pubkey(&path, true).encode(),
         hex::decode("e10000010e01038000002c0000000100000000").unwrap()
     );
+}
+
+#[test]
+fn continuation_command_wire_encoding() {
     assert_eq!(
         command::continue_interrupted(vec![1, 2]).encode(),
         vec![0xf8, 1, 0, 1, 2, 1, 2]
     );
+}
+
+#[test]
+fn registration_command_wire_encoding() {
     let wallet = wallet(Version::V2);
     let mut registration = vec![wallet.serialize().len() as u8];
     registration.extend(wallet.serialize());
@@ -71,6 +87,11 @@ fn public_command_builders() {
         )
     );
     assert_eq!(cmd.data, registration);
+}
+
+#[test]
+fn address_command_wire_encoding() {
+    let wallet = wallet(Version::V2);
     let mut address = vec![1];
     address.extend(wallet.id());
     address.extend([7; 32]);
@@ -78,6 +99,11 @@ fn public_command_builders() {
     let cmd = command::get_wallet_address(&wallet, Some(&[7; 32]), true, 9, true);
     assert_eq!(cmd.ins, EXPECTED_GET_WALLET_ADDRESS_INS);
     assert_eq!(cmd.data, address);
+}
+
+#[test]
+fn psbt_command_wire_encoding() {
+    let wallet = wallet(Version::V2);
     let mut psbt = vec![8, 1];
     psbt.extend([2; 32]);
     psbt.push(3);
@@ -87,6 +113,11 @@ fn public_command_builders() {
     let cmd = command::sign_psbt(&[8], 1, &[2; 32], 3, &[4; 32], &wallet, None);
     assert_eq!(cmd.ins, EXPECTED_SIGN_PSBT_INS);
     assert_eq!(cmd.data, psbt);
+}
+
+#[test]
+fn message_command_wire_encoding() {
+    let path = DerivationPath::from_str("m/44'/1/0").unwrap();
     let cmd = command::sign_message(5, &[6; 32], &path);
     assert_eq!(cmd.ins, EXPECTED_SIGN_MESSAGE_INS);
     let mut message = hex::decode("038000002c000000010000000005").unwrap();
