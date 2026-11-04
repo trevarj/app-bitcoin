@@ -549,7 +549,11 @@ async fn empty_message_signature_is_an_unexpected_result() {
 #[tokio::test]
 async fn registration_followup_failures_do_not_return_a_hmac() {
     use ledger_bitcoin_client::{error::BitcoinClientError, interpreter::InterpreterError};
-    let case = &test_cases("./tests/data/register_wallet.json")[1];
+    let cases = test_cases("./tests/data/register_wallet.json");
+    let case = cases
+        .iter()
+        .find(|case| case["version"].as_u64() == Some(wallet::Version::V2 as u64))
+        .unwrap();
     let keys: Vec<_> = case["keys"]
         .as_array()
         .unwrap()
@@ -563,44 +567,44 @@ async fn registration_followup_failures_do_not_return_a_hmac() {
         keys,
     );
     let wrong_address = "tb1pws8wvnj99ca6acf8kq7pjk7vyxknah0d9mexckh5s0vu2ccy68js9am6u7";
-    let responses = [
-        format!("<= {}9000", hex::encode(wrong_address.as_bytes())),
-        "<= 9000".into(),
-        "<= 6985".into(),
-        format!("<= 4000{}e000", "00".repeat(32)),
+    type RegistrationResult = Result<([u8; 32], [u8; 32]), BitcoinClientError<utils::MockError>>;
+    let responses: [(String, fn(RegistrationResult) -> bool); 4] = [
+        (
+            format!("<= {}9000", hex::encode(wrong_address.as_bytes())),
+            |result| matches!(result, Err(BitcoinClientError::InvalidResponse(_))),
+        ),
+        ("<= 9000".into(), |result| {
+            matches!(
+                result,
+                Err(BitcoinClientError::UnexpectedResult { command: 3, .. })
+            )
+        }),
+        ("<= 6985".into(), |result| {
+            matches!(
+                result,
+                Err(BitcoinClientError::Device {
+                    command: 3,
+                    status: ledger_bitcoin_client::apdu::StatusWord::Deny
+                })
+            )
+        }),
+        (format!("<= 4000{}e000", "00".repeat(32)), |result| {
+            matches!(
+                result,
+                Err(BitcoinClientError::Interpreter(
+                    InterpreterError::UnknownHash
+                ))
+            )
+        }),
     ];
-    for (index, response) in responses.iter().enumerate() {
+    for (response, expected) in &responses {
         let mut exchanges: Vec<String> = serde_json::from_value(case["exchanges"].clone()).unwrap();
         exchanges.extend(
             serde_json::from_value::<Vec<String>>(case["address_exchanges"].clone()).unwrap(),
         );
         *exchanges.last_mut().unwrap() = response.clone();
         let store = utils::RecordStore::new(&exchanges);
-        let check = |result: Result<([u8; 32], [u8; 32]), BitcoinClientError<utils::MockError>>| {
-            match index {
-                0 => assert!(matches!(
-                    result,
-                    Err(BitcoinClientError::InvalidResponse(_))
-                )),
-                1 => assert!(matches!(
-                    result,
-                    Err(BitcoinClientError::UnexpectedResult { command: 3, .. })
-                )),
-                2 => assert!(matches!(
-                    result,
-                    Err(BitcoinClientError::Device {
-                        command: 3,
-                        status: ledger_bitcoin_client::apdu::StatusWord::Deny
-                    })
-                )),
-                _ => assert!(matches!(
-                    result,
-                    Err(BitcoinClientError::Interpreter(
-                        InterpreterError::UnknownHash
-                    ))
-                )),
-            }
-        };
+        let check = |result: RegistrationResult| assert!(expected(result));
         check(
             client::BitcoinClient::new(utils::TransportReplayer::new(store.clone()))
                 .register_wallet(&wallet),

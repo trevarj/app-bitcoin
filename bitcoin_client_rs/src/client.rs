@@ -126,8 +126,7 @@ impl<T: Transport> BitcoinClient<T> {
 
         #[cfg(feature = "paranoid_client")]
         {
-            check_address(wallet, change, address_index, &address)
-                .map_err(BitcoinClientError::from)?;
+            wallet.check_address(change, address_index, &address)?;
         }
 
         Ok(address)

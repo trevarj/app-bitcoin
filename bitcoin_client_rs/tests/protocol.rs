@@ -882,19 +882,19 @@ fn signature_application_validates_before_mutation_and_overwrites() {
 #[cfg(feature = "paranoid_client")]
 #[test]
 fn independent_address_verification_and_error_categories() {
-    use ledger_bitcoin_client::protocol::{check_address, AddressCheckError};
+    use ledger_bitcoin_client::wallet::AddressCheckError;
     let policy = wallet(Version::V2);
     let address = bitcoin::Address::from_str(
         "tb1pws8wvnj99ca6acf8kq7pjk7vyxknah0d9mexckh5s0vu2ccy68js9am6u7",
     )
     .unwrap();
-    assert_eq!(check_address(&policy, false, 0, &address), Ok(()));
+    assert_eq!(policy.check_address(false, 0, &address), Ok(()));
     assert_eq!(
-        check_address(&policy, true, 0, &address),
+        policy.check_address(true, 0, &address),
         Err(AddressCheckError::Mismatch)
     );
     assert_eq!(
-        check_address(&policy, false, 1, &address),
+        policy.check_address(false, 1, &address),
         Err(AddressCheckError::Mismatch)
     );
     let other_network = bitcoin::Address::from_script(
@@ -903,25 +903,25 @@ fn independent_address_verification_and_error_categories() {
     )
     .unwrap()
     .into_unchecked();
-    assert_eq!(check_address(&policy, false, 0, &other_network), Ok(()));
+    assert_eq!(policy.check_address(false, 0, &other_network), Ok(()));
     assert_eq!(
-        check_address(&policy, false, 1 << 31, &address),
+        policy.check_address(false, 1 << 31, &address),
         Err(AddressCheckError::Derivation)
     );
     let mut invalid = wallet(Version::V2);
     invalid.descriptor_template = "tr(@0/<0;1;2>/*)".into();
     assert_eq!(
-        check_address(&invalid, false, 0, &address),
-        Err(AddressCheckError::Policy)
+        invalid.check_address(false, 0, &address),
+        Err(AddressCheckError::GetDescriptor)
     );
     invalid.descriptor_template = "invalid(@0/**)".into();
     assert_eq!(
-        check_address(&invalid, false, 0, &address),
+        invalid.check_address(false, 0, &address),
         Err(AddressCheckError::Descriptor)
     );
     invalid.descriptor_template = "tr(musig(@0)/**)".into();
     assert!(matches!(
-        check_address(&invalid, false, 0, &address),
+        invalid.check_address(false, 0, &address),
         Err(AddressCheckError::Musig(_))
     ));
 
@@ -944,9 +944,9 @@ fn independent_address_verification_and_error_categories() {
         .address(bitcoin::Network::Testnet)
         .unwrap()
         .into_unchecked();
-    assert_eq!(check_address(&musig, false, 9, &expected), Ok(()));
+    assert_eq!(musig.check_address(false, 9, &expected), Ok(()));
     assert_eq!(
-        check_address(&musig, true, 9, &expected),
+        musig.check_address(true, 9, &expected),
         Err(AddressCheckError::Mismatch)
     );
 }
