@@ -606,6 +606,51 @@ fn response_step_moves_success_and_preserves_original_error_context() {
     assert_eq!(interpreter.yielded(), vec![vec![7, 8], vec![7, 8]]);
 }
 
+#[test]
+fn psbt_result_batch_preserves_empty_order_and_error_precedence() {
+    use ledger_bitcoin_client::{
+        protocol::{parse_sign_psbt_results, SignPsbtYieldedObject},
+        PartialSignatureError,
+    };
+    assert!(parse_sign_psbt_results(vec![]).unwrap().is_empty());
+    let unknown = |index| vec![0xfe, 0, 0, 0, 0x80, index, 0xde, 0xad];
+    let parsed = parse_sign_psbt_results(vec![unknown(2), unknown(1)]).unwrap();
+    assert_eq!(
+        parsed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert!(matches!(&parsed[0].1, SignPsbtYieldedObject::Unknown(data) if data == &[0xde, 0xad]));
+
+    let malformed = [vec![0, 33], vec![0; 33], vec![1; 8]].concat();
+    let all = vec![malformed.clone(), vec![1], unknown(3)];
+    let expected = all.concat();
+    let error = parse_sign_psbt_results(all).unwrap_err();
+    assert!(matches!(error.source, PartialSignatureError::InvalidLength));
+    assert_eq!(error.data, expected);
+
+    let allocation = malformed.as_ptr();
+    let malformed_bytes = malformed.clone();
+    let error = parse_sign_psbt_results(vec![unknown(0), malformed, unknown(1)]).unwrap_err();
+    assert_eq!(error.data, malformed_bytes);
+    assert_eq!(error.data.as_ptr(), allocation);
+    assert!(matches!(error.source, PartialSignatureError::PubKey(_)));
+
+    let mut oversized = bitcoin::consensus::serialize(&bitcoin::VarInt(u64::MAX));
+    oversized.extend(bitcoin::consensus::serialize(&bitcoin::VarInt(
+        u32::MAX as u64 + 1,
+    )));
+    oversized.extend([0xde, 0xad]);
+    let error = parse_sign_psbt_results(vec![oversized]).unwrap_err();
+    assert!(matches!(
+        error.source,
+        PartialSignatureError::InvalidInputIndex
+    ));
+    let debug = format!("{error:?}");
+    assert!(debug.contains("data_len"));
+    assert!(!debug.contains("222, 173"));
+    assert_eq!(error.to_string(), "Invalid SIGN_PSBT yielded response");
+}
+
 fn unsigned_psbt() -> bitcoin::psbt::Psbt {
     use bitcoin::{
         absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
@@ -629,14 +674,10 @@ fn unsigned_psbt() -> bitcoin::psbt::Psbt {
 }
 
 #[test]
-fn psbt_maps_forward_unknown_and_proprietary_keys_and_reject_conflicts() {
+fn psbt_preparation_delegates_custom_values_and_propagates_map_errors() {
     use bitcoin::psbt::raw::{Key, ProprietaryKey};
-    use ledger_bitcoin_client::{
-        protocol::prepare_sign_psbt,
-        psbt::{get_v2_maps, PsbtV2Error},
-    };
+    use ledger_bitcoin_client::{protocol::prepare_sign_psbt, psbt::PsbtV2Error};
     const TEST_UNKNOWN_KEY_TYPE: u8 = 0x70;
-    const PSBT_PROPRIETARY_KEY_TYPE: u8 = 0xfc;
     const PSBT_GLOBAL_TX_VERSION: u8 = 0x02;
     const PSBT_GLOBAL_FALLBACK_LOCKTIME: u8 = 0x03;
     const PSBT_GLOBAL_INPUT_COUNT: u8 = 0x04;
@@ -665,17 +706,6 @@ fn psbt_maps_forward_unknown_and_proprietary_keys_and_reject_conflicts() {
         .proprietary
         .insert(proprietary.clone(), vec![5]);
     psbt.outputs[0].proprietary.insert(proprietary, vec![6]);
-    let maps = get_v2_maps(&psbt).unwrap();
-    for (i, map) in [&maps.global, &maps.inputs[0], &maps.outputs[0]]
-        .iter()
-        .enumerate()
-    {
-        assert!(map.contains(&(vec![TEST_UNKNOWN_KEY_TYPE, 9], vec![i as u8 + 1])));
-        assert!(map.contains(&(
-            vec![PSBT_PROPRIETARY_KEY_TYPE, 2, b'h', b'w', 1, 9],
-            vec![i as u8 + 4]
-        )));
-    }
     let (_, mut interpreter) = prepare_sign_psbt(&psbt, &wallet(Version::V2), None).unwrap();
     for value in 1..=6 {
         let preimage = [MERKLE_LEAF_PREFIX, value];
@@ -717,10 +747,6 @@ fn psbt_maps_forward_unknown_and_proprietary_keys_and_reject_conflicts() {
                     key: vec![],
                 },
                 vec![42],
-            );
-            assert_eq!(
-                get_v2_maps(&conflict).err(),
-                Some(PsbtV2Error::UnexpectedV2Field(key_type))
             );
             assert_eq!(
                 prepare_sign_psbt(&conflict, &wallet(Version::V2), None).err(),
