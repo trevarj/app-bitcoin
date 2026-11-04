@@ -16,6 +16,9 @@ use ledger_bitcoin_client::{
 const KEY: &str = "[f5acc2fd/86'/1'/0']tpubDDKYE6BREvDsSWMazgHoyQWiJwYaDDYPbCFjYxN3HFXJP5fokeiK4hwK5tTLBNEDBwrDXn8cQ4v9b2xdW62Xr5yxoQdMu1v6c7UDXYVH27U";
 const MERKLE_LEAF_PREFIX: u8 = 0;
 const SHA256_HASH_TYPE: u8 = 0;
+const COMMAND_CODE_LEN: usize = 1;
+const HASH_LEN: usize = 32;
+const MORE_ELEMENTS_HEADER_LEN: usize = 2;
 
 // Expected wire values are independent of the production APDU constants.
 const EXPECTED_BITCOIN_CLA: u8 = 0xe1;
@@ -190,9 +193,10 @@ fn missing_leaves_and_unknown_roots_are_distinct() {
     index.extend(root);
     index.extend([9; 32]);
     assert_eq!(interpreter.execute(index.clone()).unwrap(), [0, 0]);
-    index[33..].copy_from_slice(&root);
+    let leaf_hash_offset = COMMAND_CODE_LEN + HASH_LEN;
+    index[leaf_hash_offset..].copy_from_slice(&root);
     assert_eq!(interpreter.execute(index.clone()).unwrap(), [1, 0]);
-    index[1..33].fill(8);
+    index[COMMAND_CODE_LEN..leaf_hash_offset].fill(8);
     assert!(matches!(
         interpreter.execute(index),
         Err(InterpreterError::UnknownMerkleRoot)
@@ -213,16 +217,17 @@ fn missing_leaves_and_unknown_roots_are_distinct() {
 }
 
 #[test]
-fn preimage_and_proof_fragmentation_and_queue_transitions() {
+fn long_preimage_continuations_reconstruct_and_reset_the_queue() {
     use ledger_bitcoin_client::interpreter::InterpreterError;
     let mut interpreter = ClientCommandInterpreter::new();
+    const PREIMAGE_HEADER_LEN: usize = 4;
     let preimage = vec![0x55; 600];
     interpreter.add_known_preimage(preimage.clone());
     let mut request = vec![ClientCommandCode::GetPreimage as u8, SHA256_HASH_TYPE];
     request.extend(hash(&preimage));
     let first = interpreter.execute(request).unwrap();
-    assert_eq!(&first[..4], &[0xfd, 0x58, 2, 251]);
-    let mut reconstructed = first[4..].to_vec();
+    assert_eq!(&first[..PREIMAGE_HEADER_LEN], &[0xfd, 0x58, 2, 251]);
+    let mut reconstructed = first[PREIMAGE_HEADER_LEN..].to_vec();
     assert!(matches!(
         interpreter.execute(vec![ClientCommandCode::GetMerkleLeafProof as u8]),
         Err(InterpreterError::UnexpectedQueue)
@@ -231,14 +236,24 @@ fn preimage_and_proof_fragmentation_and_queue_transitions() {
         let next = interpreter
             .execute(vec![ClientCommandCode::GetMoreElements as u8])
             .unwrap();
-        assert_eq!(&next[..2], &[expected_count, 1]);
-        reconstructed.extend(&next[2..]);
+        assert_eq!(&next[..MORE_ELEMENTS_HEADER_LEN], &[expected_count, 1]);
+        reconstructed.extend(&next[MORE_ELEMENTS_HEADER_LEN..]);
     }
     assert_eq!(reconstructed, preimage);
     assert!(matches!(
         interpreter.execute(vec![ClientCommandCode::GetMoreElements as u8]),
         Err(InterpreterError::UnexpectedQueue)
     ));
+    assert!(interpreter
+        .execute(vec![ClientCommandCode::Yield as u8, 1, 2])
+        .is_ok());
+}
+
+#[test]
+fn eight_sibling_proof_continuations_reconstruct_and_reset_the_queue() {
+    use ledger_bitcoin_client::interpreter::InterpreterError;
+    const PROOF_HEADER_LEN: usize = HASH_LEN + 2;
+    let mut interpreter = ClientCommandInterpreter::new();
 
     let elements: Vec<Vec<u8>> = (0u16..256).map(|i| i.to_le_bytes().to_vec()).collect();
     let leaves: Vec<_> = elements
@@ -251,8 +266,8 @@ fn preimage_and_proof_fragmentation_and_queue_transitions() {
     request.extend(root);
     request.extend([0xfd, 0, 1, 0]);
     let first = interpreter.execute(request.clone()).unwrap();
-    assert_eq!(&first[..32], tree.get_leaf(0).unwrap());
-    assert_eq!(&first[32..34], &[8, 6]);
+    assert_eq!(&first[..HASH_LEN], tree.get_leaf(0).unwrap());
+    assert_eq!(&first[HASH_LEN..PROOF_HEADER_LEN], &[8, 6]);
     assert!(matches!(
         interpreter.execute(request.clone()),
         Err(InterpreterError::UnexpectedQueue)
@@ -260,9 +275,9 @@ fn preimage_and_proof_fragmentation_and_queue_transitions() {
     let rest = interpreter
         .execute(vec![ClientCommandCode::GetMoreElements as u8])
         .unwrap();
-    assert_eq!(&rest[..2], &[2, 32]);
-    let mut proof = first[34..].to_vec();
-    proof.extend(&rest[2..]);
+    assert_eq!(&rest[..MORE_ELEMENTS_HEADER_LEN], &[2, 32]);
+    let mut proof = first[PROOF_HEADER_LEN..].to_vec();
+    proof.extend(&rest[MORE_ELEMENTS_HEADER_LEN..]);
     assert_eq!(proof, tree.get_leaf_proof(0).unwrap().concat());
     assert!(matches!(
         interpreter.execute(vec![ClientCommandCode::GetMoreElements as u8]),
@@ -271,6 +286,12 @@ fn preimage_and_proof_fragmentation_and_queue_transitions() {
     request.pop();
     request.push(1);
     assert!(interpreter.execute(request).is_ok());
+}
+
+#[test]
+fn interpreter_rejects_malformed_requests() {
+    use ledger_bitcoin_client::interpreter::InterpreterError;
+    let mut interpreter = ClientCommandInterpreter::default();
     assert!(matches!(
         interpreter.execute(vec![]),
         Err(InterpreterError::EmptyInput)
