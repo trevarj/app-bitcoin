@@ -150,6 +150,37 @@ fn public_merkle_and_interpreter() {
 }
 
 #[test]
+fn missing_leaves_and_unknown_roots_are_distinct() {
+    use ledger_bitcoin_client::interpreter::InterpreterError;
+    let mut interpreter = ClientCommandInterpreter::new();
+    let root = interpreter.add_known_list(&[b"hello"]);
+    let mut index = vec![ClientCommandCode::GetMerkleLeafIndex as u8];
+    index.extend(root);
+    index.extend([9; 32]);
+    assert_eq!(interpreter.execute(index.clone()).unwrap(), [0, 0]);
+    index[33..].copy_from_slice(&root);
+    assert_eq!(interpreter.execute(index.clone()).unwrap(), [1, 0]);
+    index[1..33].fill(8);
+    assert!(matches!(
+        interpreter.execute(index),
+        Err(InterpreterError::UnknownMerkleRoot)
+    ));
+    let mut proof = vec![ClientCommandCode::GetMerkleLeafProof as u8];
+    proof.extend([8; 32]);
+    proof.extend([1, 0]);
+    assert!(matches!(
+        interpreter.execute(proof),
+        Err(InterpreterError::UnknownMerkleRoot)
+    ));
+    let mut preimage = vec![ClientCommandCode::GetPreimage as u8, SHA256_HASH_TYPE];
+    preimage.extend([9; 32]);
+    assert!(matches!(
+        interpreter.execute(preimage),
+        Err(InterpreterError::UnknownHash)
+    ));
+}
+
+#[test]
 fn preimage_and_proof_fragmentation_and_queue_transitions() {
     use ledger_bitcoin_client::interpreter::InterpreterError;
     let mut interpreter = ClientCommandInterpreter::new();
