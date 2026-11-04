@@ -295,29 +295,12 @@ jobs:
       package_directory: "bitcoin_client_js"
 
   job_test_rust_client:
-    name: Rust client (${{ matrix.name }})
-    needs: job_build
+    name: Rust client
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: pure
-            command: cargo test -p ledger_bitcoin_client --no-default-features --lib --test protocol
-          - name: client
-            command: cargo test -p ledger_bitcoin_client --no-default-features --features client
-          - name: async
-            command: cargo test -p ledger_bitcoin_client --no-default-features --features async
-          - name: default
-            command: cargo test -p ledger_bitcoin_client
-          - name: pure-paranoid
-            command: cargo test -p ledger_bitcoin_client --no-default-features --features paranoid_client --lib --test protocol
-          - name: wasm-pure
-            target: wasm32-unknown-unknown
-            command: cargo check -p ledger_bitcoin_client --no-default-features --target wasm32-unknown-unknown
-          - name: wasm-paranoid
-            target: wasm32-unknown-unknown
-            command: cargo check -p ledger_bitcoin_client --no-default-features --features paranoid_client --target wasm32-unknown-unknown
+
+    defaults:
+      run:
+        working-directory: bitcoin_client_rs
 
     container:
       image: ghcr.io/ledgerhq/ledger-app-builder/ledger-app-builder:latest
@@ -326,18 +309,53 @@ jobs:
       - name: Clone
         uses: actions/checkout@v4
 
+      - name: Identify Rust toolchain and Cargo home
+        id: rust
+        run: |
+          echo "version=$(rustc --version)" >> "$GITHUB_OUTPUT"
+          echo "cargo-home=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Cargo downloads and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.rust.outputs.cargo-home }}/registry/index
+            ${{ steps.rust.outputs.cargo-home }}/registry/cache
+            ${{ steps.rust.outputs.cargo-home }}/git/db
+            bitcoin_client_rs/target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-client-${{ steps.rust.outputs.version }}-${{ hashFiles('bitcoin_client_rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rust-client-${{ steps.rust.outputs.version }}-
+
       - name: Install WASM target
-        if: matrix.target == 'wasm32-unknown-unknown'
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run feature checks
-        working-directory: bitcoin_client_rs
-        run: ${{ matrix.command }}
-
       - name: Check formatting
-        if: matrix.name == 'default'
-        working-directory: bitcoin_client_rs
         run: cargo fmt -p ledger_bitcoin_client -- --check
+
+      - name: Test pure protocol including doctests
+        run: cargo test -p ledger_bitcoin_client --no-default-features
+
+      - name: Test pure paranoid protocol including doctests
+        run: cargo test -p ledger_bitcoin_client --no-default-features --features paranoid_client
+
+      - name: Test synchronous client
+        run: cargo test -p ledger_bitcoin_client --no-default-features --features client
+
+      - name: Test asynchronous client
+        run: cargo test -p ledger_bitcoin_client --no-default-features --features async
+
+      - name: Test default features
+        run: cargo test -p ledger_bitcoin_client
+
+      - name: Check pure WASM
+        run: cargo check -p ledger_bitcoin_client --no-default-features --target wasm32-unknown-unknown
+
+      - name: Check paranoid WASM
+        run: cargo check -p ledger_bitcoin_client --no-default-features --features paranoid_client --target wasm32-unknown-unknown
+
+      - name: Clippy
+        run: cargo clippy -p ledger_bitcoin_client --all-targets
 
   deploy_rust_client:
     name: Deploy rust client library
