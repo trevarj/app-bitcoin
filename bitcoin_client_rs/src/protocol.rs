@@ -16,9 +16,9 @@ use bitcoin::{
 };
 
 use crate::{
-    apdu::APDUCommand,
+    apdu::{APDUCommand, StatusWord},
     command,
-    interpreter::{get_merkleized_map_commitment, ClientCommandInterpreter},
+    interpreter::{get_merkleized_map_commitment, ClientCommandInterpreter, InterpreterError},
     psbt::{get_v2_maps, PartialSignature, PartialSignatureError, PsbtV2Error},
     wallet::WalletPolicy,
 };
@@ -99,14 +99,53 @@ pub fn prepare_get_wallet_address(
     )
 }
 
-/// Executes one delegated device request and prepares its CONTINUE command.
-/// Call this only for an interrupted-execution response, with its status bytes removed.
-/// The caller owns transport exchanges and the status loop.
-pub fn continue_interrupted(
-    interpreter: &mut ClientCommandInterpreter,
-    request: Vec<u8>,
-) -> Result<APDUCommand, crate::interpreter::InterpreterError> {
-    Ok(command::continue_interrupted(interpreter.execute(request)?))
+/// The next action after a device response, without performing transport I/O.
+pub enum Step {
+    Continue(APDUCommand),
+    Done(Vec<u8>),
+}
+
+/// A device-status or delegated-request failure, independent of the transport.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum RequestError {
+    Device { command: u8, status: StatusWord },
+    Interpreter(InterpreterError),
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device { command, status } => {
+                write!(f, "Command {:#04x} failed: {:?}", command, status)
+            }
+            Self::Interpreter(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Handles one response to the original request or one of its CONTINUE commands.
+///
+/// Pass the original instruction on every call, including after continuations.
+/// Success moves the response into `Done`. Interrupted execution requires an
+/// interpreter; without one it is a device error, like every other failure status.
+/// Response data must exclude the status bytes. The caller performs exchanges.
+pub fn handle_response(
+    command: u8,
+    status: StatusWord,
+    data: Vec<u8>,
+    interpreter: Option<&mut ClientCommandInterpreter>,
+) -> Result<Step, RequestError> {
+    match (status, interpreter) {
+        (StatusWord::OK, _) => Ok(Step::Done(data)),
+        (StatusWord::InterruptedExecution, Some(interpreter)) => {
+            let response = interpreter
+                .execute(data)
+                .map_err(RequestError::Interpreter)?;
+            Ok(Step::Continue(command::continue_interrupted(response)))
+        }
+        _ => Err(RequestError::Device { command, status }),
+    }
 }
 
 /// Lowers a PSBT to v2 maps and prepares their delegated Merkle commitments.

@@ -1,3 +1,4 @@
+use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
 
 use bitcoin::{
@@ -491,7 +492,21 @@ fn wallet_and_message_preparation_supply_delegated_preimages() {
 
 #[test]
 fn continuation_preserves_fragment_queue_yields_and_errors() {
-    use ledger_bitcoin_client::{interpreter::InterpreterError, protocol::continue_interrupted};
+    use ledger_bitcoin_client::{
+        apdu::StatusWord,
+        interpreter::InterpreterError,
+        protocol::{handle_response, RequestError, Step},
+    };
+    let continue_interrupted =
+        |interpreter: &mut ClientCommandInterpreter, data| match handle_response(
+            EXPECTED_SIGN_PSBT_INS,
+            StatusWord::InterruptedExecution,
+            data,
+            Some(interpreter),
+        )? {
+            Step::Continue(command) => Ok(command),
+            Step::Done(_) => panic!("interrupted response must continue"),
+        };
     let mut interpreter = ClientCommandInterpreter::new();
     let preimage = vec![0x55; 256];
     interpreter.add_known_preimage(preimage.clone());
@@ -512,15 +527,17 @@ fn continuation_preserves_fragment_queue_yields_and_errors() {
     );
     assert!(matches!(
         continue_interrupted(&mut interpreter, more),
-        Err(InterpreterError::UnexpectedQueue)
+        Err(RequestError::Interpreter(InterpreterError::UnexpectedQueue))
     ));
     assert!(matches!(
         continue_interrupted(&mut interpreter, vec![]),
-        Err(InterpreterError::EmptyInput)
+        Err(RequestError::Interpreter(InterpreterError::EmptyInput))
     ));
     assert!(matches!(
         continue_interrupted(&mut interpreter, vec![0xff]),
-        Err(InterpreterError::UnknownCommand(0xff))
+        Err(RequestError::Interpreter(InterpreterError::UnknownCommand(
+            0xff
+        )))
     ));
     let yielded = vec![ClientCommandCode::Yield as u8, 1, 2];
     assert_eq!(
@@ -530,6 +547,63 @@ fn continuation_preserves_fragment_queue_yields_and_errors() {
         hex::decode("f801000100").unwrap()
     );
     assert_eq!(interpreter.yielded(), vec![vec![1, 2]]);
+}
+
+#[test]
+fn response_step_moves_success_and_preserves_original_error_context() {
+    use ledger_bitcoin_client::{
+        apdu::StatusWord,
+        protocol::{handle_response, RequestError, Step},
+    };
+    let data = vec![1, 2, 3];
+    let allocation = data.as_ptr();
+    match handle_response(EXPECTED_SIGN_PSBT_INS, StatusWord::OK, data, None).unwrap() {
+        Step::Done(data) => {
+            assert_eq!(data, [1, 2, 3]);
+            assert_eq!(data.as_ptr(), allocation);
+        }
+        Step::Continue(_) => panic!("success must be terminal"),
+    }
+    assert!(matches!(
+        handle_response(
+            EXPECTED_SIGN_PSBT_INS,
+            StatusWord::InterruptedExecution,
+            vec![0xff],
+            None
+        ),
+        Err(RequestError::Device {
+            command: EXPECTED_SIGN_PSBT_INS,
+            status: StatusWord::InterruptedExecution
+        })
+    ));
+    let mut interpreter = ClientCommandInterpreter::default();
+    for _ in 0..2 {
+        assert!(matches!(
+            handle_response(
+                EXPECTED_SIGN_PSBT_INS,
+                StatusWord::InterruptedExecution,
+                vec![ClientCommandCode::Yield as u8, 7, 8],
+                Some(&mut interpreter)
+            ),
+            Ok(Step::Continue(_))
+        ));
+    }
+    for status in [
+        StatusWord::Deny,
+        StatusWord::IncorrectData,
+        StatusWord::Unknown,
+    ] {
+        assert!(matches!(
+            handle_response(EXPECTED_SIGN_PSBT_INS, status, vec![], Some(&mut interpreter)),
+            Err(RequestError::Device { command: EXPECTED_SIGN_PSBT_INS, status: actual }) if actual == status
+        ));
+    }
+    // Terminal statuses never execute even malformed delegated data.
+    assert!(matches!(
+        handle_response(EXPECTED_SIGN_PSBT_INS, StatusWord::OK, vec![0xff], Some(&mut interpreter)),
+        Ok(Step::Done(data)) if data == [0xff]
+    ));
+    assert_eq!(interpreter.yielded(), vec![vec![7, 8], vec![7, 8]]);
 }
 
 fn unsigned_psbt() -> bitcoin::psbt::Psbt {
@@ -665,7 +739,7 @@ fn psbt_maps_forward_unknown_and_proprietary_keys_and_reject_conflicts() {
 fn public_psbt_preparation_replays_recorded_delegated_exchanges() {
     use ledger_bitcoin_client::{
         apdu::StatusWord,
-        protocol::{continue_interrupted, parse_sign_psbt_yielded, prepare_sign_psbt},
+        protocol::{handle_response, parse_sign_psbt_yielded, prepare_sign_psbt, Step},
     };
     let cases: Vec<serde_json::Value> =
         serde_json::from_str(include_str!("data/sign_psbt.json")).unwrap();
@@ -693,18 +767,29 @@ fn public_psbt_preparation_replays_recorded_delegated_exchanges() {
         });
         let (mut command, mut interpreter) =
             prepare_sign_psbt(&psbt, &wallet, hmac.as_ref()).unwrap();
+        let original_instruction = command.ins;
         for pair in case["exchanges"].as_array().unwrap().chunks_exact(2) {
             let expected =
                 hex::decode(pair[0].as_str().unwrap().trim_start_matches("=> ")).unwrap();
             assert_eq!(command.encode(), expected);
-            let response =
+            let mut response =
                 hex::decode(pair[1].as_str().unwrap().trim_start_matches("<= ")).unwrap();
-            if response.ends_with(&(StatusWord::InterruptedExecution as u16).to_be_bytes()) {
-                command =
-                    continue_interrupted(&mut interpreter, response[..response.len() - 2].to_vec())
-                        .unwrap();
-            } else {
-                assert!(response.ends_with(&(StatusWord::OK as u16).to_be_bytes()));
+            let status_offset = response.len() - 2;
+            let status = StatusWord::try_from(u16::from_be_bytes(
+                response[status_offset..].try_into().unwrap(),
+            ))
+            .unwrap();
+            response.truncate(status_offset);
+            match handle_response(
+                original_instruction,
+                status,
+                response,
+                Some(&mut interpreter),
+            )
+            .unwrap()
+            {
+                Step::Continue(next) => command = next,
+                Step::Done(_) => assert_eq!(status, StatusWord::OK),
             }
         }
         let results = interpreter.yielded();
